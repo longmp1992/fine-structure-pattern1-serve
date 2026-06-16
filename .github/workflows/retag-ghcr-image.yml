@@ -1,0 +1,40 @@
+name: Retag published GHCR image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Existing image tag to copy from
+        required: true
+      target_tag:
+        description: Existing image tag to overwrite
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install crane
+        env:
+          CRANE_VERSION: v0.21.6
+        run: |
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" -o crane.tar.gz
+          tar -xzf crane.tar.gz crane
+          sudo mv crane /usr/local/bin/crane
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Copy source tag to target tag
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/fine-structure-pattern1-serve
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+        run: |
+          crane copy "${IMAGE}:${SOURCE_TAG}" "${IMAGE}:${TARGET_TAG}"
+          crane digest "${IMAGE}:${TARGET_TAG}"
