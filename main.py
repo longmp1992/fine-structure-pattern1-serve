@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -8,6 +9,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import pandas as pd
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
+from sklearn.neighbors import KNeighborsRegressor
 
 
 def bootstrap_runtime_env() -> None:
@@ -33,15 +40,35 @@ except Exception:  # pragma: no cover - optional preflight helper
 try:
     from histoseg.contour import (
         Pattern1IsolineConfig,
+        Pattern1IsolineResult,
         compute_segmentation_confidence_score,
-        run_pattern1_isoline,
+    )
+    from histoseg.contour.pattern1_isoline import (
+        _normalize_cluster_label,
+        _validate_label_scheme,
+        align_clusters_with_cells,
+        extract_contour_paths,
+        filter_loops_by_cell_count,
+        generate_synthetic_bg_in_bbox,
+        make_mesh_from_xy,
+        sample_background_from_other_cells_plus_synth,
+        tissue_mask_from_xy,
     )
 
     HISTOSEG_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - startup fallback only
     Pattern1IsolineConfig = None  # type: ignore[assignment]
+    Pattern1IsolineResult = None  # type: ignore[assignment]
     compute_segmentation_confidence_score = None  # type: ignore[assignment]
-    run_pattern1_isoline = None  # type: ignore[assignment]
+    _normalize_cluster_label = None  # type: ignore[assignment]
+    _validate_label_scheme = None  # type: ignore[assignment]
+    align_clusters_with_cells = None  # type: ignore[assignment]
+    extract_contour_paths = None  # type: ignore[assignment]
+    filter_loops_by_cell_count = None  # type: ignore[assignment]
+    generate_synthetic_bg_in_bbox = None  # type: ignore[assignment]
+    make_mesh_from_xy = None  # type: ignore[assignment]
+    sample_background_from_other_cells_plus_synth = None  # type: ignore[assignment]
+    tissue_mask_from_xy = None  # type: ignore[assignment]
     HISTOSEG_IMPORT_ERROR = str(exc)
 
 
@@ -49,7 +76,8 @@ APP_NAME = "Fine Structure Pattern1 Explorer"
 APP_DESCRIPTION = (
     "A SciLifeLab Serve Gradio app for the original HistoSeg Pattern1 contour workflow: "
     "upload Xenium cells.parquet and clusters.csv, choose Pattern1 cluster IDs, and tune "
-    "the KNN and Gaussian sigma parameters before generating isoline contours."
+    "the KNN and Gaussian sigma parameters before generating isoline contours. "
+    "Blank grid cells inside the tissue mask are also modeled as background."
 )
 DEFAULT_PATTERN1 = "10,23,19"
 DEFAULT_WORK_DIR = Path(os.environ.get("APP_DATA_DIR", "./project-vol")).resolve()
@@ -65,6 +93,14 @@ class RuntimeProfile:
     syn_bg_max: int
     scale_label: str
     notes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BlankGridBackgroundStats:
+    traditional_bg_points: int
+    empty_grid_bg_points: int
+    empty_grid_candidate_points: int
+    occupied_grid_count: int
 
 
 def resolve_work_dir() -> Path:
@@ -314,6 +350,326 @@ def emit_status(
     return "\n".join(status_lines), preview_path, summary, archive_path, output_files or []
 
 
+def grid_step_um(xx: np.ndarray, yy: np.ndarray) -> tuple[float, float]:
+    step_x = float(abs(xx[0, 1] - xx[0, 0])) if xx.shape[1] > 1 else 1.0
+    step_y = float(abs(yy[1, 0] - yy[0, 0])) if yy.shape[0] > 1 else 1.0
+    return step_x, step_y
+
+
+def build_cell_occupancy_mask(all_xy: np.ndarray, xx: np.ndarray, yy: np.ndarray) -> np.ndarray:
+    occupied = np.zeros_like(xx, dtype=bool)
+    if all_xy.size == 0:
+        return occupied
+
+    x0 = float(xx[0, 0])
+    y0 = float(yy[0, 0])
+    step_x, step_y = grid_step_um(xx, yy)
+
+    x_idx = np.rint((all_xy[:, 0] - x0) / step_x).astype(int)
+    y_idx = np.rint((all_xy[:, 1] - y0) / step_y).astype(int)
+    x_idx = np.clip(x_idx, 0, xx.shape[1] - 1)
+    y_idx = np.clip(y_idx, 0, yy.shape[0] - 1)
+    occupied[y_idx, x_idx] = True
+    return occupied
+
+
+def sample_empty_grid_background(
+    *,
+    all_xy: np.ndarray,
+    target_xy: np.ndarray,
+    xx: np.ndarray,
+    yy: np.ndarray,
+    tissue_mask: np.ndarray,
+    d_max: float,
+    margin_um: float,
+    max_points: int,
+    seed: int,
+) -> tuple[np.ndarray, int, int]:
+    """Use blank grid cells inside the tissue mask as explicit background candidates."""
+    occupied = build_cell_occupancy_mask(all_xy, xx, yy)
+    empty_mask = tissue_mask & ~occupied
+
+    xmin, ymin = target_xy.min(axis=0)
+    xmax, ymax = target_xy.max(axis=0)
+    pad = float(d_max) + float(margin_um)
+    bbox_mask = (
+        (xx >= xmin - pad)
+        & (xx <= xmax + pad)
+        & (yy >= ymin - pad)
+        & (yy <= ymax + pad)
+    )
+    empty_mask &= bbox_mask
+
+    empty_xy = np.c_[xx[empty_mask], yy[empty_mask]].astype(float)
+    candidate_count = int(len(empty_xy))
+    occupied_count = int(occupied.sum())
+    if candidate_count == 0:
+        return np.empty((0, 2), dtype=float), candidate_count, occupied_count
+
+    target_tree = cKDTree(np.asarray(target_xy, dtype=float))
+    target_dist, _ = target_tree.query(empty_xy, k=1)
+    empty_xy = empty_xy[target_dist <= float(d_max)]
+    if len(empty_xy) == 0:
+        return np.empty((0, 2), dtype=float), candidate_count, occupied_count
+
+    rng = np.random.default_rng(seed)
+    if len(empty_xy) > max_points:
+        idx = rng.choice(len(empty_xy), size=max_points, replace=False)
+        empty_xy = empty_xy[idx]
+    return empty_xy, candidate_count, occupied_count
+
+
+def combine_background_sources(
+    *,
+    empty_grid_bg_xy: np.ndarray,
+    traditional_bg_xy: np.ndarray,
+    max_points: int,
+    seed: int,
+) -> np.ndarray:
+    """Prioritize blank grid background points, then fill the remaining budget."""
+    rng = np.random.default_rng(seed)
+    if len(empty_grid_bg_xy) >= max_points:
+        idx = rng.choice(len(empty_grid_bg_xy), size=max_points, replace=False)
+        return empty_grid_bg_xy[idx]
+
+    if len(traditional_bg_xy) == 0:
+        return empty_grid_bg_xy
+
+    remaining = max_points - len(empty_grid_bg_xy)
+    if len(traditional_bg_xy) > remaining:
+        idx = rng.choice(len(traditional_bg_xy), size=remaining, replace=False)
+        traditional_bg_xy = traditional_bg_xy[idx]
+
+    if len(empty_grid_bg_xy) == 0:
+        return traditional_bg_xy
+    return np.vstack([empty_grid_bg_xy, traditional_bg_xy])
+
+
+def run_pattern1_isoline_blank_grid(
+    cfg: Pattern1IsolineConfig,
+) -> tuple[Pattern1IsolineResult, BlankGridBackgroundStats]:
+    """Run Pattern1 isoline with blank grid cells treated as explicit background."""
+    out_dir = Path(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    label_scheme = _validate_label_scheme(cfg.label_scheme)
+
+    merged, id_col_used, x_col, y_col = align_clusters_with_cells(
+        cfg.clusters_csv,
+        cfg.cells_parquet,
+        barcode_col=cfg.barcode_col,
+        cluster_col=cfg.cluster_col,
+    )
+
+    merged = merged.copy()
+    merged["cluster"] = merged["cluster"].map(_normalize_cluster_label)
+    merged = merged.loc[merged["cluster"] != ""].copy()
+
+    p1 = {_normalize_cluster_label(x) for x in cfg.pattern1_clusters}
+    p1 = {x for x in p1 if x != ""}
+    if len(p1) == 0:
+        raise ValueError("pattern1_clusters is empty after normalization.")
+
+    merged["_is_p1"] = merged["cluster"].isin(p1)
+    p1_df = merged.loc[merged["_is_p1"], [id_col_used, x_col, y_col]].copy()
+    if len(p1_df) < 10:
+        raise RuntimeError(f"pattern1 cells too few after merge: {len(p1_df)}")
+
+    target_ids = set(p1_df[id_col_used].astype(str))
+    target_xy = p1_df[[x_col, y_col]].to_numpy(float)
+    all_xy = merged[[x_col, y_col]].to_numpy(float)
+
+    syn_bg_xy: np.ndarray | None = None
+    if cfg.use_synth_bg:
+        if cfg.tissue_boundary_csv is None:
+            raise ValueError("use_synth_bg=True but tissue_boundary_csv was not provided.")
+        boundary_xy = pd.read_csv(cfg.tissue_boundary_csv)
+        if {"x", "y"}.issubset(boundary_xy.columns):
+            boundary_xy_np = boundary_xy[["x", "y"]].to_numpy(float)
+        elif {"X", "Y"}.issubset(boundary_xy.columns):
+            boundary_xy_np = boundary_xy[["X", "Y"]].to_numpy(float)
+        else:
+            raise ValueError(
+                f"tissue_boundary.csv must contain x,y or X,Y columns, got {list(boundary_xy.columns)}"
+            )
+        syn_bg_xy = generate_synthetic_bg_in_bbox(
+            boundary_xy_np,
+            expand_um=cfg.bbox_expand_um,
+            density=cfg.syn_bg_density,
+            min_n=cfg.syn_bg_min,
+            max_n=cfg.syn_bg_max,
+            seed=cfg.random_state,
+        )
+
+    xx, yy, grid = make_mesh_from_xy(
+        target_xy,
+        grid_n=cfg.grid_n,
+        pad_fraction=cfg.pad_fraction,
+        margin_um=cfg.margin_um,
+    )
+    tissue_mask = tissue_mask_from_xy(all_xy, xx, yy, max_dist_threshold=cfg.max_dist_threshold)
+
+    traditional_bg_xy = sample_background_from_other_cells_plus_synth(
+        cells_df=merged.rename(columns={id_col_used: "tmp_id"}),
+        synthetic_bg_xy=syn_bg_xy,
+        target_ids={str(x) for x in target_ids},
+        target_xy=target_xy,
+        cell_id_col="tmp_id",
+        x_col=x_col,
+        y_col=y_col,
+        d_min=cfg.bg_d_min,
+        d_max=cfg.bg_d_max,
+        max_points=cfg.bg_max_points,
+        seed=cfg.random_state,
+        margin_um=cfg.margin_um,
+    )
+
+    empty_grid_bg_xy, empty_grid_candidates, occupied_grid_count = sample_empty_grid_background(
+        all_xy=all_xy,
+        target_xy=target_xy,
+        xx=xx,
+        yy=yy,
+        tissue_mask=tissue_mask,
+        d_max=cfg.bg_d_max,
+        margin_um=cfg.margin_um,
+        max_points=cfg.bg_max_points,
+        seed=cfg.random_state,
+    )
+    bg0_xy = combine_background_sources(
+        empty_grid_bg_xy=empty_grid_bg_xy,
+        traditional_bg_xy=traditional_bg_xy,
+        max_points=cfg.bg_max_points,
+        seed=cfg.random_state,
+    )
+    if len(bg0_xy) == 0:
+        raise RuntimeError(
+            "No background points were sampled. Try relaxing bg_d_max, lowering grid_n, or uploading tissue_boundary.csv."
+        )
+
+    X_train = np.vstack([bg0_xy, target_xy])
+    if label_scheme == "p1_is_one":
+        y_train = np.hstack([np.zeros(len(bg0_xy)), np.ones(len(target_xy))])
+    else:
+        y_train = np.hstack([np.ones(len(bg0_xy)), np.zeros(len(target_xy))])
+
+    reg = KNeighborsRegressor(n_neighbors=cfg.knn_k, weights="distance")
+    reg.fit(X_train, y_train)
+
+    prob = reg.predict(grid).reshape(xx.shape)
+    prob_smooth = gaussian_filter(prob, sigma=cfg.smooth_sigma)
+    prob_smooth_masked = prob_smooth.copy()
+    prob_smooth_masked[~tissue_mask] = np.nan
+
+    verts_list = extract_contour_paths(xx, yy, prob_smooth_masked, level=cfg.isoline_level)
+    verts_list = filter_loops_by_cell_count(verts_list, target_xy, min_cells_inside=cfg.min_cells_inside)
+    if len(verts_list) == 0:
+        raise RuntimeError(
+            "No isoline found.\n"
+            "Suggestions: lower min_cells_inside, raise knn_k, lower smooth_sigma for finer structures, or raise grid_n."
+        )
+
+    conf_score: float | None = None
+    conf_stats: dict[str, object] | None = None
+    if cfg.compute_confidence_score:
+        conf_res = compute_segmentation_confidence_score(
+            clusters_csv=cfg.clusters_csv,
+            cells_parquet=cfg.cells_parquet,
+            pattern1_clusters=cfg.pattern1_clusters,
+        )
+        conf_score = float(conf_res.score_mean)
+        conf_stats = dict(conf_res.stats)
+
+    params_path: Path | None = None
+    if cfg.save_params_json:
+        params = {
+            **cfg.__dict__,
+            "id_col_used": id_col_used,
+            "x_col": x_col,
+            "y_col": y_col,
+            "n_target_cells": int(len(target_xy)),
+            "n_bg0": int(len(bg0_xy)),
+            "n_contours": int(len(verts_list)),
+            "label_scheme": label_scheme,
+            "segmentation_confidence_score": conf_score,
+            "segmentation_confidence_stats": conf_stats,
+            "traditional_bg_points": int(len(traditional_bg_xy)),
+            "empty_grid_bg_points": int(len(empty_grid_bg_xy)),
+            "empty_grid_candidate_points": int(empty_grid_candidates),
+            "occupied_grid_count": int(occupied_grid_count),
+            "blank_grid_background_enabled": True,
+        }
+        params_path = out_dir / "params.json"
+        params_path.write_text(
+            json.dumps(params, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+
+    if cfg.save_contours_npy:
+        for i, verts in enumerate(verts_list):
+            np.save(out_dir / f"pattern1_isoline_{cfg.isoline_level:g}_{i}.npy", verts)
+
+    preview_path: Path | None = None
+    if cfg.save_preview_png:
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(10, 10))
+        if len(traditional_bg_xy) > 0:
+            plt.scatter(
+                traditional_bg_xy[:, 0],
+                traditional_bg_xy[:, 1],
+                s=1,
+                alpha=0.03,
+                label="traditional bg",
+            )
+        if len(empty_grid_bg_xy) > 0:
+            plt.scatter(
+                empty_grid_bg_xy[:, 0],
+                empty_grid_bg_xy[:, 1],
+                s=1,
+                alpha=0.05,
+                label="blank grid bg",
+            )
+        plt.scatter(target_xy[:, 0], target_xy[:, 1], s=3, alpha=0.85, label="pattern1 cells")
+        for verts in verts_list:
+            plt.plot(verts[:, 0], verts[:, 1], linewidth=2)
+        plt.gca().set_aspect("equal")
+
+        title = (
+            f"Pattern1 segmentation | isoline={cfg.isoline_level:g} | contours={len(verts_list)} "
+            f"| blank_grid_bg={len(empty_grid_bg_xy)}"
+        )
+        if conf_score is not None:
+            title += f" | confidence(mean)={conf_score:.4f}"
+        plt.title(title)
+        plt.legend(frameon=False)
+        plt.tight_layout()
+        preview_path = out_dir / f"pattern1_isoline_{cfg.isoline_level:g}.png"
+        plt.savefig(preview_path, dpi=300)
+        plt.close()
+
+    result = Pattern1IsolineResult(
+        out_dir=out_dir,
+        id_col_used=id_col_used,
+        x_col=x_col,
+        y_col=y_col,
+        n_target_cells=int(len(target_xy)),
+        n_bg0_points=int(len(bg0_xy)),
+        contours=list(verts_list),
+        label_scheme=label_scheme,
+        segmentation_confidence_score=conf_score,
+        segmentation_confidence_stats=conf_stats,
+        params_json=params_path,
+        preview_png=preview_path,
+    )
+    stats = BlankGridBackgroundStats(
+        traditional_bg_points=int(len(traditional_bg_xy)),
+        empty_grid_bg_points=int(len(empty_grid_bg_xy)),
+        empty_grid_candidate_points=int(empty_grid_candidates),
+        occupied_grid_count=int(occupied_grid_count),
+    )
+    return result, stats
+
+
 def run_analysis(
     cells_parquet: object | None,
     clusters_csv: object | None,
@@ -443,6 +799,7 @@ def run_analysis(
             f"min_cells_inside: {min_cells_inside}",
             f"label scheme: {label_scheme_description(label_scheme)}",
             f"Synthetic background: {'enabled' if synth_enabled else 'disabled'}",
+            "Blank grid background: enabled (empty tissue-mask grid cells are treated as background)",
         ]
         preflight_lines.extend(runtime_notes)
 
@@ -487,7 +844,7 @@ def run_analysis(
             f"clusters={summary['selected_clusters']} | grid_n={cfg.grid_n} | knn_k={cfg.knn_k} | "
             f"smooth_sigma={cfg.smooth_sigma}"
         )
-        result = run_pattern1_isoline(cfg)
+        result, blank_grid_stats = run_pattern1_isoline_blank_grid(cfg)
 
         if compute_confidence_score:
             try:
@@ -509,6 +866,13 @@ def run_analysis(
                 "n_target_cells": int(result.n_target_cells),
                 "n_bg0_points": int(result.n_bg0_points),
                 "n_contours": int(len(result.contours)),
+                "blank_grid_background": {
+                    "enabled": True,
+                    "traditional_bg_points": int(blank_grid_stats.traditional_bg_points),
+                    "empty_grid_bg_points": int(blank_grid_stats.empty_grid_bg_points),
+                    "empty_grid_candidate_points": int(blank_grid_stats.empty_grid_candidate_points),
+                    "occupied_grid_count": int(blank_grid_stats.occupied_grid_count),
+                },
                 "preview_png": str(result.preview_png) if result.preview_png is not None else None,
                 "params_json": str(result.params_json) if result.params_json is not None else None,
             }
@@ -526,6 +890,7 @@ def run_analysis(
             f"Contours found: {len(result.contours)}",
             f"Target cells: {result.n_target_cells}",
             f"Background points: {result.n_bg0_points}",
+            f"Blank grid background points used: {blank_grid_stats.empty_grid_bg_points}",
             f"Preview PNG: {'yes' if result.preview_png is not None else 'no'}",
             f"Output files: {len(output_files)}",
             f"Elapsed seconds: {summary['run_seconds']}",

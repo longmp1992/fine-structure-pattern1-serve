@@ -11,6 +11,7 @@ It is intentionally not the multi-structure app. The UI exposes the single-struc
 - `min_cells_inside`
 
 It also keeps the optional synthetic background controls used by the upstream Pattern1 implementation.
+In addition, this wrapper now treats blank grid cells inside the tissue mask as explicit background points, which is useful for finer structures such as gland lumens.
 
 ## Inputs
 
