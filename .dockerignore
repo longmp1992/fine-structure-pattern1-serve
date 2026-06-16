@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.git/
+.github/
+.venv/
+project-vol/
+runs/
