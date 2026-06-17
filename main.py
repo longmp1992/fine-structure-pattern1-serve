@@ -76,7 +76,7 @@ APP_NAME = "Fine Structure Pattern1 Explorer"
 APP_DESCRIPTION = (
     "A SciLifeLab Serve Gradio app for the original HistoSeg Pattern1 contour workflow: "
     "upload Xenium cells.parquet and clusters.csv, choose Pattern1 cluster IDs, and tune "
-    "the KNN and Gaussian sigma parameters before generating isoline contours. "
+    "the KNN, Gaussian sigma, and isoline level parameters before generating isoline contours. "
     "Blank grid cells inside the tissue mask are also modeled as background."
 )
 DEFAULT_PATTERN1 = "10,23,19"
@@ -678,6 +678,7 @@ def run_analysis(
     grid_n: int,
     knn_k: int,
     smooth_sigma: float,
+    isoline_level: float,
     min_cells_inside: int,
     margin_um: float,
     max_dist_threshold: float,
@@ -756,6 +757,7 @@ def run_analysis(
                     "grid_n": int(grid_n),
                     "knn_k": int(knn_k),
                     "smooth_sigma": float(smooth_sigma),
+                    "isoline_level": float(isoline_level),
                     "min_cells_inside": int(min_cells_inside),
                     "margin_um": float(margin_um),
                     "max_dist_threshold": float(max_dist_threshold),
@@ -772,6 +774,7 @@ def run_analysis(
                     "grid_n": int(runtime_profile.grid_n),
                     "knn_k": int(knn_k),
                     "smooth_sigma": float(smooth_sigma),
+                    "isoline_level": float(isoline_level),
                     "min_cells_inside": int(min_cells_inside),
                     "margin_um": float(margin_um),
                     "max_dist_threshold": float(max_dist_threshold),
@@ -796,6 +799,7 @@ def run_analysis(
             f"grid_n: requested {grid_n}, effective {runtime_profile.grid_n}",
             f"knn_k: {knn_k}",
             f"smooth_sigma: {smooth_sigma:.2f}",
+            f"isoline_level: {isoline_level:.2f}",
             f"min_cells_inside: {min_cells_inside}",
             f"label scheme: {label_scheme_description(label_scheme)}",
             f"Synthetic background: {'enabled' if synth_enabled else 'disabled'}",
@@ -820,6 +824,7 @@ def run_analysis(
             grid_n=int(runtime_profile.grid_n),
             knn_k=int(knn_k),
             smooth_sigma=float(smooth_sigma),
+            isoline_level=float(isoline_level),
             margin_um=float(margin_um),
             max_dist_threshold=float(max_dist_threshold),
             bg_d_min=float(bg_d_min),
@@ -842,7 +847,7 @@ def run_analysis(
         log_event(
             "Running Pattern1 isoline | "
             f"clusters={summary['selected_clusters']} | grid_n={cfg.grid_n} | knn_k={cfg.knn_k} | "
-            f"smooth_sigma={cfg.smooth_sigma}"
+            f"smooth_sigma={cfg.smooth_sigma} | isoline_level={cfg.isoline_level}"
         )
         result, blank_grid_stats = run_pattern1_isoline_blank_grid(cfg)
 
@@ -890,6 +895,7 @@ def run_analysis(
             f"Contours found: {len(result.contours)}",
             f"Target cells: {result.n_target_cells}",
             f"Background points: {result.n_bg0_points}",
+            f"Isoline level: {cfg.isoline_level:.2f}",
             f"Blank grid background points used: {blank_grid_stats.empty_grid_bg_points}",
             f"Preview PNG: {'yes' if result.preview_png is not None else 'no'}",
             f"Output files: {len(output_files)}",
@@ -1164,7 +1170,7 @@ with gr.Blocks(
           <p>{APP_DESCRIPTION}</p>
           <div class="hero-metrics">
             <span>Original Pattern1 KNN contour workflow</span>
-            <span>Direct control of grid_n, knn_k, sigma</span>
+            <span>Direct control of grid_n, knn_k, sigma, isoline</span>
             <span>Preview PNG + params.json + contour .npy downloads</span>
           </div>
         </div>
@@ -1192,10 +1198,11 @@ with gr.Blocks(
           </div>
           <div class="guide-card">
             <div class="guide-step">Step 3</div>
-            <h3>Tune KNN and sigma</h3>
+            <h3>Tune KNN, sigma, and isoline</h3>
             <p>
-              Adjust <code>grid_n</code>, <code>knn_k</code>, <code>smooth_sigma</code>, and
-              <code>min_cells_inside</code>, then run the original contour workflow.
+              Adjust <code>grid_n</code>, <code>knn_k</code>, <code>smooth_sigma</code>,
+              <code>isoline_level</code>, and <code>min_cells_inside</code>, then run the original
+              contour workflow.
             </p>
           </div>
         </div>
@@ -1260,6 +1267,14 @@ with gr.Blocks(
                 maximum=12.0,
                 step=0.25,
                 value=5.0,
+            )
+            isoline_level = gr.Slider(
+                label="isoline_level (contour threshold)",
+                minimum=0.05,
+                maximum=0.95,
+                step=0.01,
+                value=0.50,
+                info="Lower values expand the contour; higher values make the contour stricter.",
             )
             min_cells_inside = gr.Slider(
                 label="min_cells_inside",
@@ -1337,6 +1352,7 @@ with gr.Blocks(
             grid_n,
             knn_k,
             smooth_sigma,
+            isoline_level,
             min_cells_inside,
             margin_um,
             max_dist_threshold,

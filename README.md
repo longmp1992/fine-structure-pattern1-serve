@@ -8,6 +8,7 @@ It is intentionally not the multi-structure app. The UI exposes the single-struc
 - `grid_n`
 - `knn_k`
 - `smooth_sigma`
+- `isoline_level`
 - `min_cells_inside`
 
 It also keeps the optional synthetic background controls used by the upstream Pattern1 implementation.
@@ -32,7 +33,7 @@ For each run, the app creates a new run directory and writes:
 
 - `params.json`
 - `pattern1_isoline_*.npy`
-- `pattern1_isoline_0.5.png`
+- `pattern1_isoline_<isoline_level>.png`
 - a ZIP archive when disk space allows
 
 ## Local Docker test
