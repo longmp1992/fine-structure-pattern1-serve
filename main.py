@@ -75,9 +75,10 @@ except Exception as exc:  # pragma: no cover - startup fallback only
 APP_NAME = "Fine Structure Pattern1 Explorer"
 APP_DESCRIPTION = (
     "A SciLifeLab Serve Gradio app for the original HistoSeg Pattern1 contour workflow: "
-    "upload Xenium cells.parquet together with either clusters.csv or transcript.parquet, "
-    "choose Pattern1 cluster IDs or a single gene, and tune the KNN, Gaussian sigma, and "
-    "isoline level parameters before generating isoline contours. "
+    "use browser uploads or mounted project-storage paths for Xenium cells.parquet together "
+    "with either clusters.csv or transcript.parquet, choose Pattern1 cluster IDs or a single "
+    "gene, and tune the KNN, Gaussian sigma, and isoline level parameters before generating "
+    "isoline contours. "
     "Blank grid cells inside the tissue mask are also modeled as background."
 )
 DEFAULT_PATTERN1 = "10,23,19"
@@ -85,6 +86,8 @@ DEFAULT_WORK_DIR = Path(os.environ.get("APP_DATA_DIR", "./project-vol")).resolve
 FALLBACK_WORK_DIR = Path("/tmp/project-vol")
 SOURCE_MODE_CLUSTER = "cluster_ids"
 SOURCE_MODE_TRANSCRIPT = "transcript_gene"
+INPUT_MODE_UPLOAD = "upload_files"
+INPUT_MODE_STORAGE = "mounted_storage"
 
 
 @dataclass(frozen=True)
@@ -114,6 +117,13 @@ class TranscriptInputSchema:
     cell_id_col: str | None
 
 
+@dataclass(frozen=True)
+class ResolvedInputFile:
+    path: Path
+    source: str
+    original: str
+
+
 def resolve_work_dir() -> Path:
     for candidate in (DEFAULT_WORK_DIR, FALLBACK_WORK_DIR):
         try:
@@ -131,6 +141,29 @@ def resolve_work_dir() -> Path:
 
 WORK_DIR = resolve_work_dir()
 RUNS_DIR = WORK_DIR / "runs"
+
+
+def configured_input_roots() -> tuple[Path, ...]:
+    raw_env = os.environ.get("APP_ALLOWED_INPUT_ROOTS", "")
+    candidates = [item.strip() for item in raw_env.split(os.pathsep) if item.strip()]
+    if not candidates:
+        candidates = ["/home/data", "/srv/shiny-server/data"]
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(path)
+    return tuple(roots)
+
+
+ALLOWED_INPUT_ROOTS = configured_input_roots()
+PRIMARY_INPUT_ROOT = ALLOWED_INPUT_ROOTS[0] if ALLOWED_INPUT_ROOTS else Path("/home/data")
+INPUT_ROOTS_LABEL = ", ".join(str(path) for path in ALLOWED_INPUT_ROOTS)
 
 
 def ensure_workdirs() -> None:
@@ -169,6 +202,43 @@ def safe_filename_component(raw: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(raw).strip())
     cleaned = cleaned.strip("._")
     return cleaned or "pattern1"
+
+
+def path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_storage_file(storage_path: str | None, *, label: str, suffixes: tuple[str, ...]) -> Path | None:
+    raw = str(storage_path or "").strip()
+    if not raw:
+        return None
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = PRIMARY_INPUT_ROOT / candidate
+
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ValueError(f"Could not resolve the mounted-storage path for {label}: {exc}") from exc
+
+    resolved_roots = tuple(root.expanduser().resolve(strict=False) for root in ALLOWED_INPUT_ROOTS)
+    if not any(path_is_within(resolved, root) for root in resolved_roots):
+        raise ValueError(
+            f"{label} must stay inside the configured mounted storage roots: {INPUT_ROOTS_LABEL}"
+        )
+    if not resolved.exists():
+        raise FileNotFoundError(f"{label} was not found at mounted-storage path: {resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"{label} must point to a file, not a directory: {resolved}")
+    if suffixes and resolved.suffix.lower() not in suffixes:
+        suffix_label = ", ".join(suffixes)
+        raise ValueError(f"{label} must use one of these suffixes: {suffix_label}")
+    return resolved
 
 
 def parquet_column_names(parquet_path: Path) -> list[str]:
@@ -239,12 +309,37 @@ def list_transcript_genes(transcript_parquet: Path) -> list[str]:
     return genes
 
 
-def load_transcript_gene_options(transcript_upload: object | None):
+def pick_transcript_source(
+    input_mode: str,
+    transcript_upload: object | None,
+    transcript_storage_path: str | None,
+) -> Path | None:
+    if input_mode == INPUT_MODE_STORAGE:
+        return resolve_storage_file(
+            transcript_storage_path,
+            label="transcript.parquet",
+            suffixes=(".parquet",),
+        )
+
     if transcript_upload is None:
-        return gr.update(choices=[], value=None, interactive=True)
+        return None
 
     transcript_path = Path(str(transcript_upload))
     if not transcript_path.exists():
+        return None
+    return transcript_path
+
+
+def load_transcript_gene_options(
+    input_mode: str,
+    transcript_upload: object | None,
+    transcript_storage_path: str | None,
+):
+    try:
+        transcript_path = pick_transcript_source(input_mode, transcript_upload, transcript_storage_path)
+    except Exception:
+        return gr.update(choices=[], value=None, interactive=True)
+    if transcript_path is None:
         return gr.update(choices=[], value=None, interactive=True)
 
     try:
@@ -257,12 +352,19 @@ def load_transcript_gene_options(transcript_upload: object | None):
     return gr.update(choices=genes, value=genes[0], interactive=True)
 
 
-def update_pattern1_source_ui(source_mode: str):
+def update_visibility(input_mode: str, source_mode: str):
     use_cluster_mode = source_mode != SOURCE_MODE_TRANSCRIPT
+    use_upload_mode = input_mode != INPUT_MODE_STORAGE
     return (
+        gr.update(visible=use_upload_mode),
+        gr.update(visible=use_upload_mode and use_cluster_mode),
+        gr.update(visible=use_upload_mode and not use_cluster_mode),
+        gr.update(visible=use_upload_mode),
+        gr.update(visible=not use_upload_mode),
+        gr.update(visible=not use_upload_mode and use_cluster_mode),
+        gr.update(visible=not use_upload_mode and not use_cluster_mode),
+        gr.update(visible=not use_upload_mode),
         gr.update(visible=use_cluster_mode),
-        gr.update(visible=use_cluster_mode),
-        gr.update(visible=not use_cluster_mode),
         gr.update(visible=not use_cluster_mode),
         gr.update(visible=use_cluster_mode),
         gr.update(visible=use_cluster_mode),
@@ -280,18 +382,72 @@ def stage_uploaded_file(uploaded: object | None, target_dir: Path) -> Path | Non
     return destination
 
 
+def resolve_input_file(
+    *,
+    input_mode: str,
+    uploaded: object | None,
+    storage_path: str | None,
+    target_dir: Path,
+    label: str,
+    suffixes: tuple[str, ...],
+) -> ResolvedInputFile | None:
+    if input_mode == INPUT_MODE_STORAGE:
+        resolved = resolve_storage_file(storage_path, label=label, suffixes=suffixes)
+        if resolved is None:
+            return None
+        return ResolvedInputFile(path=resolved, source=INPUT_MODE_STORAGE, original=str(resolved))
+
+    staged = stage_uploaded_file(uploaded, target_dir)
+    if staged is None:
+        return None
+    return ResolvedInputFile(path=staged, source=INPUT_MODE_UPLOAD, original=str(uploaded))
+
+
 def resolve_inputs(
     *,
+    input_mode: str,
     cells_upload: object | None,
+    cells_storage_path: str | None,
     clusters_upload: object | None,
+    clusters_storage_path: str | None,
     tissue_upload: object | None,
+    tissue_storage_path: str | None,
     transcript_upload: object | None,
+    transcript_storage_path: str | None,
     target_dir: Path,
-) -> tuple[Path | None, Path | None, Path | None, Path | None]:
-    cells_path = stage_uploaded_file(cells_upload, target_dir)
-    clusters_path = stage_uploaded_file(clusters_upload, target_dir)
-    tissue_path = stage_uploaded_file(tissue_upload, target_dir)
-    transcript_path = stage_uploaded_file(transcript_upload, target_dir)
+) -> tuple[ResolvedInputFile | None, ResolvedInputFile | None, ResolvedInputFile | None, ResolvedInputFile | None]:
+    cells_path = resolve_input_file(
+        input_mode=input_mode,
+        uploaded=cells_upload,
+        storage_path=cells_storage_path,
+        target_dir=target_dir,
+        label="cells.parquet",
+        suffixes=(".parquet",),
+    )
+    clusters_path = resolve_input_file(
+        input_mode=input_mode,
+        uploaded=clusters_upload,
+        storage_path=clusters_storage_path,
+        target_dir=target_dir,
+        label="clusters.csv",
+        suffixes=(".csv",),
+    )
+    tissue_path = resolve_input_file(
+        input_mode=input_mode,
+        uploaded=tissue_upload,
+        storage_path=tissue_storage_path,
+        target_dir=target_dir,
+        label="tissue_boundary.csv",
+        suffixes=(".csv",),
+    )
+    transcript_path = resolve_input_file(
+        input_mode=input_mode,
+        uploaded=transcript_upload,
+        storage_path=transcript_storage_path,
+        target_dir=target_dir,
+        label="transcript.parquet",
+        suffixes=(".parquet",),
+    )
     return cells_path, clusters_path, tissue_path, transcript_path
 
 
@@ -1074,11 +1230,16 @@ def run_transcript_gene_isoline_blank_grid(
 
 
 def run_analysis(
+    input_mode: str,
     source_mode: str,
     cells_parquet: object | None,
+    cells_storage_path: str | None,
     clusters_csv: object | None,
+    clusters_storage_path: str | None,
     transcript_parquet: object | None,
+    transcript_storage_path: str | None,
     tissue_boundary_csv: object | None,
+    tissue_storage_path: str | None,
     pattern1_clusters: str,
     transcript_gene: str | None,
     grid_n: int,
@@ -1116,24 +1277,41 @@ def run_analysis(
     summary: dict[str, object] = {"work_dir": str(run_dir)}
 
     try:
-        progress(0.05, desc="Staging uploaded files")
+        use_storage_mode = input_mode == INPUT_MODE_STORAGE
+        progress(0.05, desc="Resolving input files")
         yield emit_status(
             phase="staging-inputs",
             run_dir=run_dir,
-            lines=["Copying uploaded files into the app workspace."]
+            lines=[
+                "Reading files from mounted project storage."
+                if use_storage_mode
+                else "Copying uploaded files into the app workspace."
+            ]
             + ([f"Cleaned old run directories: {', '.join(removed_runs)}"] if removed_runs else []),
             summary=summary,
         )
 
-        cells_path, clusters_path, tissue_path, transcript_path = resolve_inputs(
+        cells_input, clusters_input, tissue_input, transcript_input = resolve_inputs(
+            input_mode=input_mode,
             cells_upload=cells_parquet,
+            cells_storage_path=cells_storage_path,
             clusters_upload=clusters_csv,
+            clusters_storage_path=clusters_storage_path,
             tissue_upload=tissue_boundary_csv,
+            tissue_storage_path=tissue_storage_path,
             transcript_upload=transcript_parquet,
+            transcript_storage_path=transcript_storage_path,
             target_dir=upload_dir,
         )
-        if cells_path is None:
+        if cells_input is None:
+            if use_storage_mode:
+                raise ValueError("Missing cells.parquet. Enter a mounted-storage path for the Xenium cell coordinate file.")
             raise ValueError("Missing cells.parquet. Please upload the Xenium cell coordinate file.")
+
+        cells_path = cells_input.path
+        clusters_path = clusters_input.path if clusters_input is not None else None
+        tissue_path = tissue_input.path if tissue_input is not None else None
+        transcript_path = transcript_input.path if transcript_input is not None else None
 
         use_cluster_mode = source_mode != SOURCE_MODE_TRANSCRIPT
         analysis_mode = SOURCE_MODE_CLUSTER if use_cluster_mode else SOURCE_MODE_TRANSCRIPT
@@ -1176,7 +1354,43 @@ def run_analysis(
                 "estimated_cluster_rows": estimated_cluster_rows,
                 "estimated_transcript_rows": estimated_transcript_rows,
                 "analysis_mode": analysis_mode,
+                "input_mode": input_mode,
+                "input_sources": {
+                    "cells_parquet": {
+                        "path": str(cells_path),
+                        "source": cells_input.source,
+                        "original": cells_input.original,
+                    },
+                    "clusters_csv": (
+                        {
+                            "path": str(clusters_path),
+                            "source": clusters_input.source,
+                            "original": clusters_input.original,
+                        }
+                        if clusters_input is not None and clusters_path is not None
+                        else None
+                    ),
+                    "transcript_parquet": (
+                        {
+                            "path": str(transcript_path),
+                            "source": transcript_input.source,
+                            "original": transcript_input.original,
+                        }
+                        if transcript_input is not None and transcript_path is not None
+                        else None
+                    ),
+                    "tissue_boundary_csv": (
+                        {
+                            "path": str(tissue_path),
+                            "source": tissue_input.source,
+                            "original": tissue_input.original,
+                        }
+                        if tissue_input is not None and tissue_path is not None
+                        else None
+                    ),
+                },
                 "requested_parameters": {
+                    "input_mode": input_mode,
                     "source_mode": analysis_mode,
                     "grid_n": int(grid_n),
                     "knn_k": int(knn_k),
@@ -1196,6 +1410,7 @@ def run_analysis(
                     "compute_confidence_score": bool(compute_confidence_score),
                 },
                 "effective_parameters": {
+                    "input_mode": input_mode,
                     "source_mode": analysis_mode,
                     "grid_n": int(runtime_profile.grid_n),
                     "knn_k": int(knn_k),
@@ -1218,15 +1433,24 @@ def run_analysis(
             }
         )
 
-        preflight_lines = [f"Pattern1 source mode: {analysis_mode}"]
+        preflight_lines = [
+            f"Input mode: {'mounted project storage' if use_storage_mode else 'browser upload'}",
+            f"Pattern1 source mode: {analysis_mode}",
+            f"cells.parquet path: {cells_path}",
+        ]
         if use_cluster_mode:
             if clusters_path is None:
+                if use_storage_mode:
+                    raise ValueError(
+                        "Missing clusters.csv. Enter a mounted-storage path for the GraphClust cluster assignment file."
+                    )
                 raise ValueError("Missing clusters.csv. Please upload the GraphClust cluster assignment file.")
             selected_clusters = parse_pattern1_clusters(pattern1_clusters)
             summary["selected_clusters"] = [str(item) for item in selected_clusters]
             summary["label_scheme"] = label_scheme_description(label_scheme)
             preflight_lines.extend(
                 [
+                    f"clusters.csv path: {clusters_path}",
                     f"Pattern1 clusters: {', '.join(str(item) for item in selected_clusters)}",
                     f"Estimated cells.parquet rows: {estimated_cells_rows if estimated_cells_rows is not None else 'unknown'}",
                     f"Estimated clusters.csv rows: {estimated_cluster_rows if estimated_cluster_rows is not None else 'unknown'}",
@@ -1242,12 +1466,15 @@ def run_analysis(
             )
         else:
             if transcript_path is None:
+                if use_storage_mode:
+                    raise ValueError("Missing transcript.parquet. Enter a mounted-storage path for the Xenium transcript file.")
                 raise ValueError("Missing transcript.parquet. Please upload the Xenium transcript file.")
             selected_gene = parse_transcript_gene(transcript_gene)
             summary["transcript_gene"] = selected_gene
             summary["label_scheme"] = "Selected transcript gene is treated as the signal of interest"
             preflight_lines.extend(
                 [
+                    f"transcript.parquet path: {transcript_path}",
                     f"Transcript gene: {selected_gene}",
                     f"Estimated cells.parquet rows: {estimated_cells_rows if estimated_cells_rows is not None else 'unknown'}",
                     f"Estimated transcript.parquet rows: {estimated_transcript_rows if estimated_transcript_rows is not None else 'unknown'}",
@@ -1668,11 +1895,11 @@ with gr.Blocks(
         <div class="guide-shell">
           <div class="guide-card">
             <div class="guide-step">Step 1</div>
-            <h3>Upload Xenium inputs</h3>
+            <h3>Choose upload or mounted storage</h3>
             <p>
-              Provide <code>cells.parquet</code> together with either <code>clusters.csv</code> or
-              <code>transcript.parquet</code>. Upload <code>tissue_boundary.csv</code> only if you
-              want synthetic background points.
+              Either upload Xenium files in the browser or point the app at mounted project-storage
+              paths such as <code>/home/data/...</code>. Then provide <code>cells.parquet</code>
+              together with either <code>clusters.csv</code> or <code>transcript.parquet</code>.
             </p>
           </div>
           <div class="guide-card">
@@ -1703,14 +1930,24 @@ with gr.Blocks(
     with gr.Row():
         with gr.Column(scale=1, elem_id="left-rail"):
             gr.HTML(
-                """
+                f"""
                 <div class="micro-guide">
                   In a standard Xenium <code>outs</code> directory, <code>cells.parquet</code> is usually in
                   the root of <code>outs</code>, while one common <code>clusters.csv</code> path is
                   <code>outs\\analysis\\clustering\\gene_expression_graphclust\\clusters.csv</code>.
                   A matching <code>transcripts.parquet</code> file is usually also in the root of <code>outs</code>.
+                  Mounted-storage mode accepts files only inside: <code>{INPUT_ROOTS_LABEL}</code>.
                 </div>
                 """
+            )
+            input_mode = gr.Radio(
+                label="Input source",
+                choices=[
+                    ("Upload files in browser", INPUT_MODE_UPLOAD),
+                    ("Use mounted project storage paths", INPUT_MODE_STORAGE),
+                ],
+                value=INPUT_MODE_UPLOAD,
+                info="Mounted-storage mode reads files directly from the attached Serve volume and avoids the 100 MB browser upload limit.",
             )
             source_mode = gr.Radio(
                 label="Pattern1 source",
@@ -1726,10 +1963,22 @@ with gr.Blocks(
                 file_types=[".parquet"],
                 type="filepath",
             )
+            cells_storage_path = gr.Textbox(
+                label="Mounted path: cells.parquet",
+                value="",
+                placeholder=f"{PRIMARY_INPUT_ROOT}/my-run/outs/cells.parquet",
+                visible=False,
+            )
             clusters_csv = gr.File(
                 label="Cluster assignments (clusters.csv)",
                 file_types=[".csv"],
                 type="filepath",
+            )
+            clusters_storage_path = gr.Textbox(
+                label="Mounted path: clusters.csv",
+                value="",
+                placeholder=f"{PRIMARY_INPUT_ROOT}/my-run/outs/analysis/clustering/gene_expression_graphclust/clusters.csv",
+                visible=False,
             )
             transcript_parquet = gr.File(
                 label="Transcripts (transcript.parquet)",
@@ -1737,10 +1986,22 @@ with gr.Blocks(
                 type="filepath",
                 visible=False,
             )
+            transcript_storage_path = gr.Textbox(
+                label="Mounted path: transcript.parquet",
+                value="",
+                placeholder=f"{PRIMARY_INPUT_ROOT}/my-run/outs/transcripts.parquet",
+                visible=False,
+            )
             tissue_boundary_csv = gr.File(
                 label="Tissue boundary (optional: tissue_boundary.csv)",
                 file_types=[".csv"],
                 type="filepath",
+            )
+            tissue_storage_path = gr.Textbox(
+                label="Mounted path: tissue_boundary.csv (optional)",
+                value="",
+                placeholder=f"{PRIMARY_INPUT_ROOT}/my-run/tissue_boundary.csv",
+                visible=False,
             )
             pattern1_clusters = gr.Textbox(
                 label="Pattern1 cluster IDs",
@@ -1758,7 +2019,7 @@ with gr.Blocks(
                 filterable=True,
                 interactive=True,
                 visible=False,
-                info="Upload transcript.parquet to auto-load genes, or type one manually.",
+                info="Upload transcript.parquet or enter a mounted-storage path to auto-load genes, or type one manually.",
             )
             grid_n = gr.Slider(
                 label="grid_n (mesh resolution)",
@@ -1855,32 +2116,76 @@ with gr.Blocks(
             output_archive = gr.File(label="Download all outputs as ZIP", file_count="single")
             output_files = gr.File(label="Download raw output files", file_count="multiple")
 
-    source_mode.change(
-        fn=update_pattern1_source_ui,
-        inputs=[source_mode],
+    input_mode.change(
+        fn=update_visibility,
+        inputs=[input_mode, source_mode],
         outputs=[
+            cells_parquet,
             clusters_csv,
-            pattern1_clusters,
             transcript_parquet,
+            tissue_boundary_csv,
+            cells_storage_path,
+            clusters_storage_path,
+            transcript_storage_path,
+            tissue_storage_path,
+            pattern1_clusters,
             transcript_gene,
             label_scheme,
             compute_confidence_score,
         ],
     )
+    source_mode.change(
+        fn=update_visibility,
+        inputs=[input_mode, source_mode],
+        outputs=[
+            cells_parquet,
+            clusters_csv,
+            transcript_parquet,
+            tissue_boundary_csv,
+            cells_storage_path,
+            clusters_storage_path,
+            transcript_storage_path,
+            tissue_storage_path,
+            pattern1_clusters,
+            transcript_gene,
+            label_scheme,
+            compute_confidence_score,
+        ],
+    )
+    source_mode.change(
+        fn=load_transcript_gene_options,
+        inputs=[input_mode, transcript_parquet, transcript_storage_path],
+        outputs=[transcript_gene],
+    )
     transcript_parquet.change(
         fn=load_transcript_gene_options,
-        inputs=[transcript_parquet],
+        inputs=[input_mode, transcript_parquet, transcript_storage_path],
+        outputs=[transcript_gene],
+    )
+    transcript_storage_path.change(
+        fn=load_transcript_gene_options,
+        inputs=[input_mode, transcript_parquet, transcript_storage_path],
+        outputs=[transcript_gene],
+    )
+    input_mode.change(
+        fn=load_transcript_gene_options,
+        inputs=[input_mode, transcript_parquet, transcript_storage_path],
         outputs=[transcript_gene],
     )
 
     run_button.click(
         fn=run_analysis,
         inputs=[
+            input_mode,
             source_mode,
             cells_parquet,
+            cells_storage_path,
             clusters_csv,
+            clusters_storage_path,
             transcript_parquet,
+            transcript_storage_path,
             tissue_boundary_csv,
+            tissue_storage_path,
             pattern1_clusters,
             transcript_gene,
             grid_n,

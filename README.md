@@ -7,6 +7,11 @@ It is intentionally not the multi-structure app. The UI exposes two single-struc
 - cluster mode: use `cells.parquet` + `clusters.csv` and choose Pattern1 cluster IDs
 - transcript mode: use `cells.parquet` + `transcripts.parquet` and choose a single gene as Pattern1
 
+Each mode supports two file-access patterns:
+
+- browser upload mode for smaller files
+- mounted-storage mode for files already available inside the Serve project volume
+
 The shared contour parameters are:
 
 - `pattern1_clusters`
@@ -22,7 +27,7 @@ In addition, this wrapper now treats blank grid cells inside the tissue mask as 
 
 ## Inputs
 
-Upload these files in the app:
+Provide these files either by browser upload or by mounted-storage path:
 
 - `cells.parquet`
 - `clusters.csv` for cluster mode
@@ -34,6 +39,8 @@ Typical Xenium locations:
 - `outs/cells.parquet`
 - `outs/analysis/clustering/gene_expression_graphclust/clusters.csv`
 - `outs/transcripts.parquet` or `outs/transcript.parquet` depending on the export
+
+Mounted-storage mode is intended for Serve project volumes such as `/home/data/...` and avoids the browser upload limit for large transcript parquet files.
 
 ## What the app writes
 
