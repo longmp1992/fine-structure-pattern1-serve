@@ -2,9 +2,15 @@
 
 This directory is a deployment-ready wrapper for the original HistoSeg `pattern1` contour workflow.
 
-It is intentionally not the multi-structure app. The UI exposes the single-structure Pattern1 algorithm and the parameters you called out:
+It is intentionally not the multi-structure app. The UI exposes two single-structure Pattern1 entry modes:
+
+- cluster mode: use `cells.parquet` + `clusters.csv` and choose Pattern1 cluster IDs
+- transcript mode: use `cells.parquet` + `transcripts.parquet` and choose a single gene as Pattern1
+
+The shared contour parameters are:
 
 - `pattern1_clusters`
+- `transcript_gene`
 - `grid_n`
 - `knn_k`
 - `smooth_sigma`
@@ -19,13 +25,15 @@ In addition, this wrapper now treats blank grid cells inside the tissue mask as 
 Upload these files in the app:
 
 - `cells.parquet`
-- `clusters.csv`
+- `clusters.csv` for cluster mode
+- `transcripts.parquet` for transcript mode
 - `tissue_boundary.csv` only if you want synthetic background points
 
 Typical Xenium locations:
 
 - `outs/cells.parquet`
 - `outs/analysis/clustering/gene_expression_graphclust/clusters.csv`
+- `outs/transcripts.parquet` or `outs/transcript.parquet` depending on the export
 
 ## What the app writes
 
@@ -34,6 +42,8 @@ For each run, the app creates a new run directory and writes:
 - `params.json`
 - `pattern1_isoline_*.npy`
 - `pattern1_isoline_<isoline_level>.png`
+- `pattern1_transcript_<gene>_isoline_*.npy` for transcript mode
+- `pattern1_transcript_<gene>_isoline_<isoline_level>.png` for transcript mode
 - a ZIP archive when disk space allows
 
 ## Local Docker test

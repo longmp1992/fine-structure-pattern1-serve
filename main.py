@@ -75,13 +75,16 @@ except Exception as exc:  # pragma: no cover - startup fallback only
 APP_NAME = "Fine Structure Pattern1 Explorer"
 APP_DESCRIPTION = (
     "A SciLifeLab Serve Gradio app for the original HistoSeg Pattern1 contour workflow: "
-    "upload Xenium cells.parquet and clusters.csv, choose Pattern1 cluster IDs, and tune "
-    "the KNN, Gaussian sigma, and isoline level parameters before generating isoline contours. "
+    "upload Xenium cells.parquet together with either clusters.csv or transcript.parquet, "
+    "choose Pattern1 cluster IDs or a single gene, and tune the KNN, Gaussian sigma, and "
+    "isoline level parameters before generating isoline contours. "
     "Blank grid cells inside the tissue mask are also modeled as background."
 )
 DEFAULT_PATTERN1 = "10,23,19"
 DEFAULT_WORK_DIR = Path(os.environ.get("APP_DATA_DIR", "./project-vol")).resolve()
 FALLBACK_WORK_DIR = Path("/tmp/project-vol")
+SOURCE_MODE_CLUSTER = "cluster_ids"
+SOURCE_MODE_TRANSCRIPT = "transcript_gene"
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,14 @@ class BlankGridBackgroundStats:
     empty_grid_bg_points: int
     empty_grid_candidate_points: int
     occupied_grid_count: int
+
+
+@dataclass(frozen=True)
+class TranscriptInputSchema:
+    gene_col: str
+    x_col: str
+    y_col: str
+    cell_id_col: str | None
 
 
 def resolve_work_dir() -> Path:
@@ -147,6 +158,117 @@ def parse_pattern1_clusters(raw: str) -> list[int | str]:
     return values
 
 
+def parse_transcript_gene(raw: str | None) -> str:
+    gene = str(raw or "").strip()
+    if not gene:
+        raise ValueError("Transcript gene cannot be empty. Please choose or type a gene from transcript.parquet.")
+    return gene
+
+
+def safe_filename_component(raw: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(raw).strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or "pattern1"
+
+
+def parquet_column_names(parquet_path: Path) -> list[str]:
+    if pq is not None:
+        return [str(name) for name in pq.ParquetFile(parquet_path).schema.names]
+    return [str(col) for col in pd.read_parquet(parquet_path).columns]
+
+
+def first_present_column(columns: list[str], candidates: tuple[str, ...], label: str) -> str:
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    raise ValueError(f"Could not find a {label} column. Available columns: {columns}")
+
+
+def detect_transcript_input_schema(transcript_parquet: Path) -> TranscriptInputSchema:
+    columns = parquet_column_names(transcript_parquet)
+    gene_col = first_present_column(
+        columns,
+        ("feature_name", "gene", "gene_name", "feature_id"),
+        "transcript gene",
+    )
+    x_col = first_present_column(
+        columns,
+        ("x_location", "x", "X", "x_centroid"),
+        "transcript x-coordinate",
+    )
+    y_col = first_present_column(
+        columns,
+        ("y_location", "y", "Y", "y_centroid"),
+        "transcript y-coordinate",
+    )
+    cell_id_col = next((candidate for candidate in ("cell_id", "CellID", "cell", "cell_barcode") if candidate in columns), None)
+    return TranscriptInputSchema(
+        gene_col=gene_col,
+        x_col=x_col,
+        y_col=y_col,
+        cell_id_col=cell_id_col,
+    )
+
+
+def detect_cell_coordinate_columns(cells_parquet: Path) -> tuple[str, str, str]:
+    columns = parquet_column_names(cells_parquet)
+    id_col = first_present_column(columns, ("cell_id", "CellID", "Barcode"), "cell ID")
+    x_col = first_present_column(columns, ("x_centroid", "x", "X", "x_location"), "cell x-coordinate")
+    y_col = first_present_column(columns, ("y_centroid", "y", "Y", "y_location"), "cell y-coordinate")
+    return id_col, x_col, y_col
+
+
+def read_parquet_subset(parquet_path: Path, columns: list[str]) -> pd.DataFrame:
+    unique_columns = list(dict.fromkeys(columns))
+    if pq is not None:
+        return pq.read_table(parquet_path, columns=unique_columns).to_pandas()
+    return pd.read_parquet(parquet_path, columns=unique_columns)
+
+
+def list_transcript_genes(transcript_parquet: Path) -> list[str]:
+    schema = detect_transcript_input_schema(transcript_parquet)
+    if pq is not None:
+        import pyarrow.compute as pc
+
+        gene_array = pq.read_table(transcript_parquet, columns=[schema.gene_col]).column(schema.gene_col)
+        raw_values = pc.unique(gene_array).to_pylist()
+    else:
+        gene_df = read_parquet_subset(transcript_parquet, [schema.gene_col])
+        raw_values = gene_df[schema.gene_col].dropna().tolist()
+    genes = sorted({str(value).strip() for value in raw_values if value is not None and str(value).strip()})
+    return genes
+
+
+def load_transcript_gene_options(transcript_upload: object | None):
+    if transcript_upload is None:
+        return gr.update(choices=[], value=None, interactive=True)
+
+    transcript_path = Path(str(transcript_upload))
+    if not transcript_path.exists():
+        return gr.update(choices=[], value=None, interactive=True)
+
+    try:
+        genes = list_transcript_genes(transcript_path)
+    except Exception:
+        return gr.update(choices=[], value=None, interactive=True)
+
+    if not genes:
+        return gr.update(choices=[], value=None, interactive=True)
+    return gr.update(choices=genes, value=genes[0], interactive=True)
+
+
+def update_pattern1_source_ui(source_mode: str):
+    use_cluster_mode = source_mode != SOURCE_MODE_TRANSCRIPT
+    return (
+        gr.update(visible=use_cluster_mode),
+        gr.update(visible=use_cluster_mode),
+        gr.update(visible=not use_cluster_mode),
+        gr.update(visible=not use_cluster_mode),
+        gr.update(visible=use_cluster_mode),
+        gr.update(visible=use_cluster_mode),
+    )
+
+
 def stage_uploaded_file(uploaded: object | None, target_dir: Path) -> Path | None:
     if uploaded is None:
         return None
@@ -163,17 +285,14 @@ def resolve_inputs(
     cells_upload: object | None,
     clusters_upload: object | None,
     tissue_upload: object | None,
+    transcript_upload: object | None,
     target_dir: Path,
-) -> tuple[Path, Path, Path | None]:
+) -> tuple[Path | None, Path | None, Path | None, Path | None]:
     cells_path = stage_uploaded_file(cells_upload, target_dir)
     clusters_path = stage_uploaded_file(clusters_upload, target_dir)
     tissue_path = stage_uploaded_file(tissue_upload, target_dir)
-
-    if cells_path is None:
-        raise ValueError("Missing cells.parquet. Please upload the Xenium cell coordinate file.")
-    if clusters_path is None:
-        raise ValueError("Missing clusters.csv. Please upload the GraphClust cluster assignment file.")
-    return cells_path, clusters_path, tissue_path
+    transcript_path = stage_uploaded_file(transcript_upload, target_dir)
+    return cells_path, clusters_path, tissue_path, transcript_path
 
 
 def build_run_dir() -> Path:
@@ -445,6 +564,36 @@ def combine_background_sources(
     return np.vstack([empty_grid_bg_xy, traditional_bg_xy])
 
 
+def sample_cell_background_plus_synth(
+    *,
+    all_xy: np.ndarray,
+    synthetic_bg_xy: np.ndarray | None,
+    max_points: int,
+    seed: int,
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    cell_bg_xy = np.asarray(all_xy, dtype=float)
+    if len(cell_bg_xy) > max_points:
+        idx = rng.choice(len(cell_bg_xy), size=max_points, replace=False)
+        return cell_bg_xy[idx]
+
+    if synthetic_bg_xy is None or len(synthetic_bg_xy) == 0:
+        return cell_bg_xy
+
+    remaining = max_points - len(cell_bg_xy)
+    if remaining <= 0:
+        return cell_bg_xy
+
+    synth_xy = np.asarray(synthetic_bg_xy, dtype=float)
+    if len(synth_xy) > remaining:
+        idx = rng.choice(len(synth_xy), size=remaining, replace=False)
+        synth_xy = synth_xy[idx]
+
+    if len(cell_bg_xy) == 0:
+        return synth_xy
+    return np.vstack([cell_bg_xy, synth_xy])
+
+
 def run_pattern1_isoline_blank_grid(
     cfg: Pattern1IsolineConfig,
 ) -> tuple[Pattern1IsolineResult, BlankGridBackgroundStats]:
@@ -670,11 +819,268 @@ def run_pattern1_isoline_blank_grid(
     return result, stats
 
 
+def run_transcript_gene_isoline_blank_grid(
+    *,
+    cells_parquet: Path,
+    transcript_parquet: Path,
+    transcript_gene: str,
+    tissue_boundary_csv: Path | None,
+    out_dir: Path,
+    grid_n: int,
+    knn_k: int,
+    smooth_sigma: float,
+    isoline_level: float,
+    margin_um: float,
+    max_dist_threshold: float,
+    bg_max_points: int,
+    bg_d_max: float,
+    min_cells_inside: int,
+    use_synth_bg: bool,
+    bbox_expand_um: float,
+    syn_bg_density: float,
+    syn_bg_min: int,
+    syn_bg_max: int,
+    random_state: int = 0,
+    pad_fraction: float = 0.02,
+) -> tuple[Pattern1IsolineResult, BlankGridBackgroundStats, dict[str, object]]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cell_id_col, cell_x_col, cell_y_col = detect_cell_coordinate_columns(cells_parquet)
+    cells_df = read_parquet_subset(cells_parquet, [cell_id_col, cell_x_col, cell_y_col]).dropna(
+        subset=[cell_x_col, cell_y_col]
+    )
+    all_xy = cells_df[[cell_x_col, cell_y_col]].to_numpy(float)
+    if len(all_xy) < 10:
+        raise RuntimeError(f"Too few cells found in cells.parquet after filtering: {len(all_xy)}")
+
+    transcript_schema = detect_transcript_input_schema(transcript_parquet)
+    transcript_columns = [transcript_schema.gene_col, transcript_schema.x_col, transcript_schema.y_col]
+    if transcript_schema.cell_id_col is not None:
+        transcript_columns.append(transcript_schema.cell_id_col)
+    selected_gene = parse_transcript_gene(transcript_gene)
+    transcript_rows_total = safe_count_parquet_rows(transcript_parquet)
+    if pq is not None:
+        target_df = pq.read_table(
+            transcript_parquet,
+            columns=transcript_columns,
+            filters=[(transcript_schema.gene_col, "=", selected_gene)],
+        ).to_pandas()
+    else:
+        transcripts_df = read_parquet_subset(transcript_parquet, transcript_columns).dropna(
+            subset=[transcript_schema.gene_col, transcript_schema.x_col, transcript_schema.y_col]
+        )
+        gene_series = transcripts_df[transcript_schema.gene_col].astype(str).str.strip()
+        target_mask = gene_series.str.casefold() == selected_gene.casefold()
+        target_df = transcripts_df.loc[target_mask].copy()
+    target_df = target_df.dropna(subset=[transcript_schema.x_col, transcript_schema.y_col])
+    target_xy = target_df[[transcript_schema.x_col, transcript_schema.y_col]].to_numpy(float)
+    if len(target_xy) < 10:
+        raise RuntimeError(
+            f"Too few transcripts found for gene '{selected_gene}' after filtering: {len(target_xy)}"
+        )
+
+    syn_bg_xy: np.ndarray | None = None
+    if use_synth_bg:
+        if tissue_boundary_csv is None:
+            raise ValueError("use_synth_bg=True but tissue_boundary_csv was not provided.")
+        boundary_xy = pd.read_csv(tissue_boundary_csv)
+        if {"x", "y"}.issubset(boundary_xy.columns):
+            boundary_xy_np = boundary_xy[["x", "y"]].to_numpy(float)
+        elif {"X", "Y"}.issubset(boundary_xy.columns):
+            boundary_xy_np = boundary_xy[["X", "Y"]].to_numpy(float)
+        else:
+            raise ValueError(
+                f"tissue_boundary.csv must contain x,y or X,Y columns, got {list(boundary_xy.columns)}"
+            )
+        syn_bg_xy = generate_synthetic_bg_in_bbox(
+            boundary_xy_np,
+            expand_um=bbox_expand_um,
+            density=syn_bg_density,
+            min_n=syn_bg_min,
+            max_n=syn_bg_max,
+            seed=random_state,
+        )
+
+    xx, yy, grid = make_mesh_from_xy(
+        target_xy,
+        grid_n=grid_n,
+        pad_fraction=pad_fraction,
+        margin_um=margin_um,
+    )
+    tissue_mask = tissue_mask_from_xy(all_xy, xx, yy, max_dist_threshold=max_dist_threshold)
+
+    traditional_bg_xy = sample_cell_background_plus_synth(
+        all_xy=all_xy,
+        synthetic_bg_xy=syn_bg_xy,
+        max_points=bg_max_points,
+        seed=random_state,
+    )
+
+    empty_grid_bg_xy, empty_grid_candidates, occupied_grid_count = sample_empty_grid_background(
+        all_xy=all_xy,
+        target_xy=target_xy,
+        xx=xx,
+        yy=yy,
+        tissue_mask=tissue_mask,
+        d_max=bg_d_max,
+        margin_um=margin_um,
+        max_points=bg_max_points,
+        seed=random_state,
+    )
+    bg0_xy = combine_background_sources(
+        empty_grid_bg_xy=empty_grid_bg_xy,
+        traditional_bg_xy=traditional_bg_xy,
+        max_points=bg_max_points,
+        seed=random_state,
+    )
+    if len(bg0_xy) == 0:
+        raise RuntimeError("No background points were generated for transcript mode.")
+
+    y_train = np.hstack([np.zeros(len(bg0_xy)), np.ones(len(target_xy))])
+    X_train = np.vstack([bg0_xy, target_xy])
+
+    reg = KNeighborsRegressor(n_neighbors=knn_k, weights="distance")
+    reg.fit(X_train, y_train)
+
+    prob = reg.predict(grid).reshape(xx.shape)
+    prob_smooth = gaussian_filter(prob, sigma=smooth_sigma)
+    prob_smooth_masked = prob_smooth.copy()
+    prob_smooth_masked[~tissue_mask] = np.nan
+
+    verts_list = extract_contour_paths(xx, yy, prob_smooth_masked, level=isoline_level)
+    verts_list = filter_loops_by_cell_count(verts_list, target_xy, min_cells_inside=min_cells_inside)
+    if len(verts_list) == 0:
+        raise RuntimeError(
+            "No transcript-driven isoline found.\n"
+            "Suggestions: lower min_cells_inside, lower isoline_level, lower smooth_sigma for finer structures, or raise grid_n."
+        )
+
+    safe_gene = safe_filename_component(selected_gene)
+    params_path = out_dir / "params.json"
+    transcript_unique_cells = None
+    if transcript_schema.cell_id_col is not None and transcript_schema.cell_id_col in target_df.columns:
+        transcript_unique_cells = int(target_df[transcript_schema.cell_id_col].nunique())
+
+    params = {
+        "analysis_mode": SOURCE_MODE_TRANSCRIPT,
+        "cells_parquet": str(cells_parquet),
+        "transcript_parquet": str(transcript_parquet),
+        "transcript_gene": selected_gene,
+        "transcript_gene_col": transcript_schema.gene_col,
+        "transcript_x_col": transcript_schema.x_col,
+        "transcript_y_col": transcript_schema.y_col,
+        "cell_id_col": cell_id_col,
+        "cell_x_col": cell_x_col,
+        "cell_y_col": cell_y_col,
+        "grid_n": int(grid_n),
+        "knn_k": int(knn_k),
+        "smooth_sigma": float(smooth_sigma),
+        "isoline_level": float(isoline_level),
+        "margin_um": float(margin_um),
+        "max_dist_threshold": float(max_dist_threshold),
+        "bg_max_points": int(bg_max_points),
+        "bg_d_max": float(bg_d_max),
+        "min_cells_inside": int(min_cells_inside),
+        "use_synth_bg": bool(use_synth_bg),
+        "bbox_expand_um": float(bbox_expand_um),
+        "syn_bg_density": float(syn_bg_density),
+        "syn_bg_min": int(syn_bg_min),
+        "syn_bg_max": int(syn_bg_max),
+        "pad_fraction": float(pad_fraction),
+        "n_target_transcripts": int(len(target_xy)),
+        "n_background_points": int(len(bg0_xy)),
+        "n_contours": int(len(verts_list)),
+        "traditional_bg_points": int(len(traditional_bg_xy)),
+        "empty_grid_bg_points": int(len(empty_grid_bg_xy)),
+        "empty_grid_candidate_points": int(empty_grid_candidates),
+        "occupied_grid_count": int(occupied_grid_count),
+        "transcript_unique_cells": transcript_unique_cells,
+        "blank_grid_background_enabled": True,
+    }
+    params_path.write_text(
+        json.dumps(params, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+    for i, verts in enumerate(verts_list):
+        np.save(out_dir / f"pattern1_transcript_{safe_gene}_isoline_{isoline_level:g}_{i}.npy", verts)
+
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 10))
+    if len(traditional_bg_xy) > 0:
+        plt.scatter(
+            traditional_bg_xy[:, 0],
+            traditional_bg_xy[:, 1],
+            s=1,
+            alpha=0.03,
+            label="cell bg",
+        )
+    if len(empty_grid_bg_xy) > 0:
+        plt.scatter(
+            empty_grid_bg_xy[:, 0],
+            empty_grid_bg_xy[:, 1],
+            s=1,
+            alpha=0.05,
+            label="blank grid bg",
+        )
+    plt.scatter(target_xy[:, 0], target_xy[:, 1], s=2, alpha=0.75, label=f"{selected_gene} transcripts")
+    for verts in verts_list:
+        plt.plot(verts[:, 0], verts[:, 1], linewidth=2)
+    plt.gca().set_aspect("equal")
+    plt.title(
+        f"Transcript Pattern1 | gene={selected_gene} | isoline={isoline_level:g} | contours={len(verts_list)}"
+    )
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    preview_path = out_dir / f"pattern1_transcript_{safe_gene}_isoline_{isoline_level:g}.png"
+    plt.savefig(preview_path, dpi=300)
+    plt.close()
+
+    result = Pattern1IsolineResult(
+        out_dir=out_dir,
+        id_col_used=transcript_schema.cell_id_col or "transcript_id",
+        x_col=transcript_schema.x_col,
+        y_col=transcript_schema.y_col,
+        n_target_cells=int(len(target_xy)),
+        n_bg0_points=int(len(bg0_xy)),
+        contours=list(verts_list),
+        label_scheme="transcript_gene_is_signal",
+        segmentation_confidence_score=None,
+        segmentation_confidence_stats=None,
+        params_json=params_path,
+        preview_png=preview_path,
+    )
+    stats = BlankGridBackgroundStats(
+        traditional_bg_points=int(len(traditional_bg_xy)),
+        empty_grid_bg_points=int(len(empty_grid_bg_xy)),
+        empty_grid_candidate_points=int(empty_grid_candidates),
+        occupied_grid_count=int(occupied_grid_count),
+    )
+    metadata = {
+        "analysis_mode": SOURCE_MODE_TRANSCRIPT,
+        "transcript_gene": selected_gene,
+        "transcript_gene_col": transcript_schema.gene_col,
+        "transcript_x_col": transcript_schema.x_col,
+        "transcript_y_col": transcript_schema.y_col,
+        "transcript_rows": int(transcript_rows_total) if transcript_rows_total is not None else None,
+        "n_target_transcripts": int(len(target_xy)),
+        "transcript_unique_cells": transcript_unique_cells,
+        "cell_id_col": cell_id_col,
+        "cell_x_col": cell_x_col,
+        "cell_y_col": cell_y_col,
+    }
+    return result, stats, metadata
+
+
 def run_analysis(
+    source_mode: str,
     cells_parquet: object | None,
     clusters_csv: object | None,
+    transcript_parquet: object | None,
     tissue_boundary_csv: object | None,
     pattern1_clusters: str,
+    transcript_gene: str | None,
     grid_n: int,
     knn_k: int,
     smooth_sigma: float,
@@ -719,16 +1125,22 @@ def run_analysis(
             summary=summary,
         )
 
-        cells_path, clusters_path, tissue_path = resolve_inputs(
+        cells_path, clusters_path, tissue_path, transcript_path = resolve_inputs(
             cells_upload=cells_parquet,
             clusters_upload=clusters_csv,
             tissue_upload=tissue_boundary_csv,
+            transcript_upload=transcript_parquet,
             target_dir=upload_dir,
         )
-        selected_clusters = parse_pattern1_clusters(pattern1_clusters)
+        if cells_path is None:
+            raise ValueError("Missing cells.parquet. Please upload the Xenium cell coordinate file.")
+
+        use_cluster_mode = source_mode != SOURCE_MODE_TRANSCRIPT
+        analysis_mode = SOURCE_MODE_CLUSTER if use_cluster_mode else SOURCE_MODE_TRANSCRIPT
 
         estimated_cells_rows = safe_count_parquet_rows(cells_path)
-        estimated_cluster_rows = safe_count_csv_rows(clusters_path)
+        estimated_cluster_rows = safe_count_csv_rows(clusters_path) if clusters_path is not None else None
+        estimated_transcript_rows = safe_count_parquet_rows(transcript_path) if transcript_path is not None else None
         synth_enabled = bool(use_synth_bg and tissue_path is not None)
         runtime_profile = choose_runtime_profile(
             requested_grid_n=grid_n,
@@ -742,6 +1154,17 @@ def run_analysis(
             runtime_notes.append(
                 "Synthetic background was disabled because tissue_boundary.csv was not uploaded."
             )
+        if not use_cluster_mode:
+            runtime_notes.append(
+                "Transcript mode treats the selected gene as the signal of interest and all cells as background."
+            )
+            runtime_notes.append(
+                "In transcript mode, min_cells_inside is applied to target transcript points inside each contour."
+            )
+            if compute_confidence_score:
+                runtime_notes.append(
+                    "Segmentation confidence score is not available in transcript mode and was skipped."
+                )
 
         effective_bg_max_points = min(int(bg_max_points), int(runtime_profile.bg_max_points))
         effective_syn_bg_min = min(int(syn_bg_min), int(runtime_profile.syn_bg_min))
@@ -751,9 +1174,10 @@ def run_analysis(
             {
                 "estimated_cells_rows": estimated_cells_rows,
                 "estimated_cluster_rows": estimated_cluster_rows,
-                "selected_clusters": [str(item) for item in selected_clusters],
-                "label_scheme": label_scheme_description(label_scheme),
+                "estimated_transcript_rows": estimated_transcript_rows,
+                "analysis_mode": analysis_mode,
                 "requested_parameters": {
+                    "source_mode": analysis_mode,
                     "grid_n": int(grid_n),
                     "knn_k": int(knn_k),
                     "smooth_sigma": float(smooth_sigma),
@@ -769,8 +1193,10 @@ def run_analysis(
                     "syn_bg_density": float(syn_bg_density),
                     "syn_bg_min": int(syn_bg_min),
                     "syn_bg_max": int(syn_bg_max),
+                    "compute_confidence_score": bool(compute_confidence_score),
                 },
                 "effective_parameters": {
+                    "source_mode": analysis_mode,
                     "grid_n": int(runtime_profile.grid_n),
                     "knn_k": int(knn_k),
                     "smooth_sigma": float(smooth_sigma),
@@ -792,19 +1218,48 @@ def run_analysis(
             }
         )
 
-        preflight_lines = [
-            f"Pattern1 clusters: {', '.join(str(item) for item in selected_clusters)}",
-            f"Estimated cells.parquet rows: {estimated_cells_rows if estimated_cells_rows is not None else 'unknown'}",
-            f"Estimated clusters.csv rows: {estimated_cluster_rows if estimated_cluster_rows is not None else 'unknown'}",
-            f"grid_n: requested {grid_n}, effective {runtime_profile.grid_n}",
-            f"knn_k: {knn_k}",
-            f"smooth_sigma: {smooth_sigma:.2f}",
-            f"isoline_level: {isoline_level:.2f}",
-            f"min_cells_inside: {min_cells_inside}",
-            f"label scheme: {label_scheme_description(label_scheme)}",
-            f"Synthetic background: {'enabled' if synth_enabled else 'disabled'}",
-            "Blank grid background: enabled (empty tissue-mask grid cells are treated as background)",
-        ]
+        preflight_lines = [f"Pattern1 source mode: {analysis_mode}"]
+        if use_cluster_mode:
+            if clusters_path is None:
+                raise ValueError("Missing clusters.csv. Please upload the GraphClust cluster assignment file.")
+            selected_clusters = parse_pattern1_clusters(pattern1_clusters)
+            summary["selected_clusters"] = [str(item) for item in selected_clusters]
+            summary["label_scheme"] = label_scheme_description(label_scheme)
+            preflight_lines.extend(
+                [
+                    f"Pattern1 clusters: {', '.join(str(item) for item in selected_clusters)}",
+                    f"Estimated cells.parquet rows: {estimated_cells_rows if estimated_cells_rows is not None else 'unknown'}",
+                    f"Estimated clusters.csv rows: {estimated_cluster_rows if estimated_cluster_rows is not None else 'unknown'}",
+                    f"grid_n: requested {grid_n}, effective {runtime_profile.grid_n}",
+                    f"knn_k: {knn_k}",
+                    f"smooth_sigma: {smooth_sigma:.2f}",
+                    f"isoline_level: {isoline_level:.2f}",
+                    f"min_cells_inside: {min_cells_inside}",
+                    f"label scheme: {label_scheme_description(label_scheme)}",
+                    f"Synthetic background: {'enabled' if synth_enabled else 'disabled'}",
+                    "Blank grid background: enabled (empty tissue-mask grid cells are treated as background)",
+                ]
+            )
+        else:
+            if transcript_path is None:
+                raise ValueError("Missing transcript.parquet. Please upload the Xenium transcript file.")
+            selected_gene = parse_transcript_gene(transcript_gene)
+            summary["transcript_gene"] = selected_gene
+            summary["label_scheme"] = "Selected transcript gene is treated as the signal of interest"
+            preflight_lines.extend(
+                [
+                    f"Transcript gene: {selected_gene}",
+                    f"Estimated cells.parquet rows: {estimated_cells_rows if estimated_cells_rows is not None else 'unknown'}",
+                    f"Estimated transcript.parquet rows: {estimated_transcript_rows if estimated_transcript_rows is not None else 'unknown'}",
+                    f"grid_n: requested {grid_n}, effective {runtime_profile.grid_n}",
+                    f"knn_k: {knn_k}",
+                    f"smooth_sigma: {smooth_sigma:.2f}",
+                    f"isoline_level: {isoline_level:.2f}",
+                    f"min_cells_inside: {min_cells_inside}",
+                    f"Synthetic background: {'enabled' if synth_enabled else 'disabled'}",
+                    "Background mode: all cells are treated as background in addition to blank grid cells.",
+                ]
+            )
         preflight_lines.extend(runtime_notes)
 
         progress(0.18, desc="Inputs ready")
@@ -815,53 +1270,84 @@ def run_analysis(
             summary=summary,
         )
 
-        cfg = Pattern1IsolineConfig(
-            clusters_csv=clusters_path,
-            cells_parquet=cells_path,
-            tissue_boundary_csv=tissue_path if synth_enabled else None,
-            out_dir=output_dir,
-            pattern1_clusters=selected_clusters,
-            grid_n=int(runtime_profile.grid_n),
-            knn_k=int(knn_k),
-            smooth_sigma=float(smooth_sigma),
-            isoline_level=float(isoline_level),
-            margin_um=float(margin_um),
-            max_dist_threshold=float(max_dist_threshold),
-            bg_d_min=float(bg_d_min),
-            bg_d_max=float(bg_d_max),
-            bg_max_points=int(effective_bg_max_points),
-            min_cells_inside=int(min_cells_inside),
-            use_synth_bg=bool(synth_enabled),
-            bbox_expand_um=float(bbox_expand_um),
-            syn_bg_density=float(runtime_profile.syn_bg_density),
-            syn_bg_min=int(effective_syn_bg_min),
-            syn_bg_max=int(effective_syn_bg_max),
-            label_scheme=label_scheme,
-            compute_confidence_score=bool(compute_confidence_score),
-            save_params_json=True,
-            save_contours_npy=True,
-            save_preview_png=True,
-        )
-
         progress(0.42, desc="Running Pattern1 isoline")
-        log_event(
-            "Running Pattern1 isoline | "
-            f"clusters={summary['selected_clusters']} | grid_n={cfg.grid_n} | knn_k={cfg.knn_k} | "
-            f"smooth_sigma={cfg.smooth_sigma} | isoline_level={cfg.isoline_level}"
-        )
-        result, blank_grid_stats = run_pattern1_isoline_blank_grid(cfg)
+        if use_cluster_mode:
+            cfg = Pattern1IsolineConfig(
+                clusters_csv=clusters_path,
+                cells_parquet=cells_path,
+                tissue_boundary_csv=tissue_path if synth_enabled else None,
+                out_dir=output_dir,
+                pattern1_clusters=selected_clusters,
+                grid_n=int(runtime_profile.grid_n),
+                knn_k=int(knn_k),
+                smooth_sigma=float(smooth_sigma),
+                isoline_level=float(isoline_level),
+                margin_um=float(margin_um),
+                max_dist_threshold=float(max_dist_threshold),
+                bg_d_min=float(bg_d_min),
+                bg_d_max=float(bg_d_max),
+                bg_max_points=int(effective_bg_max_points),
+                min_cells_inside=int(min_cells_inside),
+                use_synth_bg=bool(synth_enabled),
+                bbox_expand_um=float(bbox_expand_um),
+                syn_bg_density=float(runtime_profile.syn_bg_density),
+                syn_bg_min=int(effective_syn_bg_min),
+                syn_bg_max=int(effective_syn_bg_max),
+                label_scheme=label_scheme,
+                compute_confidence_score=bool(compute_confidence_score),
+                save_params_json=True,
+                save_contours_npy=True,
+                save_preview_png=True,
+            )
+            log_event(
+                "Running Pattern1 isoline | "
+                f"mode={analysis_mode} | clusters={summary['selected_clusters']} | grid_n={cfg.grid_n} | "
+                f"knn_k={cfg.knn_k} | smooth_sigma={cfg.smooth_sigma} | isoline_level={cfg.isoline_level}"
+            )
+            result, blank_grid_stats = run_pattern1_isoline_blank_grid(cfg)
+            target_label = "Target cells"
 
-        if compute_confidence_score:
-            try:
-                conf_res = compute_segmentation_confidence_score(
-                    clusters_csv=clusters_path,
-                    cells_parquet=cells_path,
-                    pattern1_clusters=selected_clusters,
-                )
-                summary["segmentation_confidence_score"] = float(conf_res.score_mean)
-                summary["segmentation_confidence_stats"] = dict(conf_res.stats)
-            except Exception as exc:
-                runtime_notes.append(f"Confidence score could not be computed: {exc}")
+            if compute_confidence_score:
+                try:
+                    conf_res = compute_segmentation_confidence_score(
+                        clusters_csv=clusters_path,
+                        cells_parquet=cells_path,
+                        pattern1_clusters=selected_clusters,
+                    )
+                    summary["segmentation_confidence_score"] = float(conf_res.score_mean)
+                    summary["segmentation_confidence_stats"] = dict(conf_res.stats)
+                except Exception as exc:
+                    runtime_notes.append(f"Confidence score could not be computed: {exc}")
+        else:
+            log_event(
+                "Running Pattern1 isoline | "
+                f"mode={analysis_mode} | transcript_gene={summary['transcript_gene']} | "
+                f"grid_n={runtime_profile.grid_n} | knn_k={knn_k} | smooth_sigma={smooth_sigma} | "
+                f"isoline_level={isoline_level}"
+            )
+            result, blank_grid_stats, transcript_meta = run_transcript_gene_isoline_blank_grid(
+                cells_parquet=cells_path,
+                transcript_parquet=transcript_path,
+                transcript_gene=selected_gene,
+                tissue_boundary_csv=tissue_path if synth_enabled else None,
+                out_dir=output_dir,
+                grid_n=int(runtime_profile.grid_n),
+                knn_k=int(knn_k),
+                smooth_sigma=float(smooth_sigma),
+                isoline_level=float(isoline_level),
+                margin_um=float(margin_um),
+                max_dist_threshold=float(max_dist_threshold),
+                bg_max_points=int(effective_bg_max_points),
+                bg_d_max=float(bg_d_max),
+                min_cells_inside=int(min_cells_inside),
+                use_synth_bg=bool(synth_enabled),
+                bbox_expand_um=float(bbox_expand_um),
+                syn_bg_density=float(runtime_profile.syn_bg_density),
+                syn_bg_min=int(effective_syn_bg_min),
+                syn_bg_max=int(effective_syn_bg_max),
+            )
+            summary.update(transcript_meta)
+            target_label = "Target transcripts"
 
         summary.update(
             {
@@ -893,9 +1379,9 @@ def run_analysis(
 
         final_lines = [
             f"Contours found: {len(result.contours)}",
-            f"Target cells: {result.n_target_cells}",
+            f"{target_label}: {result.n_target_cells}",
             f"Background points: {result.n_bg0_points}",
-            f"Isoline level: {cfg.isoline_level:.2f}",
+            f"Isoline level: {isoline_level:.2f}",
             f"Blank grid background points used: {blank_grid_stats.empty_grid_bg_points}",
             f"Preview PNG: {'yes' if result.preview_png is not None else 'no'}",
             f"Output files: {len(output_files)}",
@@ -1184,16 +1670,17 @@ with gr.Blocks(
             <div class="guide-step">Step 1</div>
             <h3>Upload Xenium inputs</h3>
             <p>
-              Provide <code>cells.parquet</code> and <code>clusters.csv</code>. Upload
-              <code>tissue_boundary.csv</code> only if you want synthetic background points.
+              Provide <code>cells.parquet</code> together with either <code>clusters.csv</code> or
+              <code>transcript.parquet</code>. Upload <code>tissue_boundary.csv</code> only if you
+              want synthetic background points.
             </p>
           </div>
           <div class="guide-card">
             <div class="guide-step">Step 2</div>
-            <h3>Choose Pattern1 clusters</h3>
+            <h3>Choose the Pattern1 signal</h3>
             <p>
-              Enter the cluster IDs that define the Pattern1 signal of interest, for example
-              <code>10,23,19</code>.
+              Either enter cluster IDs such as <code>10,23,19</code>, or upload
+              <code>transcript.parquet</code> and choose a single gene to use as Pattern1.
             </p>
           </div>
           <div class="guide-card">
@@ -1221,8 +1708,18 @@ with gr.Blocks(
                   In a standard Xenium <code>outs</code> directory, <code>cells.parquet</code> is usually in
                   the root of <code>outs</code>, while one common <code>clusters.csv</code> path is
                   <code>outs\\analysis\\clustering\\gene_expression_graphclust\\clusters.csv</code>.
+                  A matching <code>transcripts.parquet</code> file is usually also in the root of <code>outs</code>.
                 </div>
                 """
+            )
+            source_mode = gr.Radio(
+                label="Pattern1 source",
+                choices=[
+                    ("Cluster IDs from clusters.csv", SOURCE_MODE_CLUSTER),
+                    ("Single gene from transcript.parquet", SOURCE_MODE_TRANSCRIPT),
+                ],
+                value=SOURCE_MODE_CLUSTER,
+                info="Choose whether Pattern1 comes from clustered cells or directly from transcript coordinates.",
             )
             cells_parquet = gr.File(
                 label="Cell coordinates (cells.parquet)",
@@ -1233,6 +1730,12 @@ with gr.Blocks(
                 label="Cluster assignments (clusters.csv)",
                 file_types=[".csv"],
                 type="filepath",
+            )
+            transcript_parquet = gr.File(
+                label="Transcripts (transcript.parquet)",
+                file_types=[".parquet"],
+                type="filepath",
+                visible=False,
             )
             tissue_boundary_csv = gr.File(
                 label="Tissue boundary (optional: tissue_boundary.csv)",
@@ -1246,6 +1749,16 @@ with gr.Blocks(
                 placeholder="10,23,19",
                 info="Comma-separated cluster IDs. Newlines and semicolons are also accepted.",
                 elem_id="pattern1-clusters",
+            )
+            transcript_gene = gr.Dropdown(
+                label="Transcript gene as Pattern1",
+                choices=[],
+                value=None,
+                allow_custom_value=True,
+                filterable=True,
+                interactive=True,
+                visible=False,
+                info="Upload transcript.parquet to auto-load genes, or type one manually.",
             )
             grid_n = gr.Slider(
                 label="grid_n (mesh resolution)",
@@ -1342,13 +1855,34 @@ with gr.Blocks(
             output_archive = gr.File(label="Download all outputs as ZIP", file_count="single")
             output_files = gr.File(label="Download raw output files", file_count="multiple")
 
+    source_mode.change(
+        fn=update_pattern1_source_ui,
+        inputs=[source_mode],
+        outputs=[
+            clusters_csv,
+            pattern1_clusters,
+            transcript_parquet,
+            transcript_gene,
+            label_scheme,
+            compute_confidence_score,
+        ],
+    )
+    transcript_parquet.change(
+        fn=load_transcript_gene_options,
+        inputs=[transcript_parquet],
+        outputs=[transcript_gene],
+    )
+
     run_button.click(
         fn=run_analysis,
         inputs=[
+            source_mode,
             cells_parquet,
             clusters_csv,
+            transcript_parquet,
             tissue_boundary_csv,
             pattern1_clusters,
+            transcript_gene,
             grid_n,
             knn_k,
             smooth_sigma,
